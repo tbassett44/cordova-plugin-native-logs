@@ -1,11 +1,16 @@
 #import "CDVNativeLogs.h"
 #import <Cordova/CDV.h>
+#import <os/log.h>
+
+// Set to YES to echo JS console.log/error/warn to os_log (visible in idevicesyslog / Console.app)
+static BOOL kJSConsoleOsLogEnabled = NO;
 
 @implementation CDVNativeLogs
 
 @synthesize logCallbackId;
 @synthesize logFileSource;
 @synthesize lastFileOffset;
+@synthesize consoleBridgeActive;
 
 - (void)pluginInitialize
 {
@@ -88,6 +93,9 @@
 
     dispatch_resume(self.logFileSource);
 
+    // Inject JS console capture bridge (only when debugging is active)
+    [self startConsoleBridge];
+
     // Send initial success response
     CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:@"Log monitoring started"];
     [pluginResult setKeepCallbackAsBool:YES];
@@ -107,6 +115,74 @@
         self.logFileSource = nil;
     }
     self.logCallbackId = nil;
+
+    // Remove JS console capture bridge
+    [self stopConsoleBridge];
+}
+
+#pragma mark - JS Console Bridge
+
+- (void)startConsoleBridge {
+    if (self.consoleBridgeActive) return;
+
+    UIView *webView = self.webViewEngine.engineWebView;
+    if (![webView isKindOfClass:[WKWebView class]]) return;
+
+    WKWebView *wk = (WKWebView *)webView;
+    [wk.configuration.userContentController addScriptMessageHandler:self name:@"nativeConsole"];
+
+    NSString *js =
+        @"(function(){"
+        "if(window.__nativeConsoleActive) return;"
+        "window.__nativeConsoleActive=true;"
+        "window.__origLog=console.log;window.__origErr=console.error;window.__origWarn=console.warn;"
+        "function _s(a){try{return typeof a==='object'?JSON.stringify(a):String(a)}catch(e){return String(a)}}"
+        "function _send(l,args){try{window.webkit.messageHandlers.nativeConsole.postMessage({level:l,msg:Array.prototype.slice.call(args).map(_s).join(' ')})}catch(e){}}"
+        "console.log=function(){window.__origLog.apply(console,arguments);_send('log',arguments)};"
+        "console.error=function(){window.__origErr.apply(console,arguments);_send('error',arguments)};"
+        "console.warn=function(){window.__origWarn.apply(console,arguments);_send('warn',arguments)};"
+        "})();";
+
+    [wk evaluateJavaScript:js completionHandler:nil];
+    self.consoleBridgeActive = YES;
+    NSLog(@"[NativeLogs] JS console capture bridge injected");
+}
+
+- (void)stopConsoleBridge {
+    if (!self.consoleBridgeActive) return;
+
+    UIView *webView = self.webViewEngine.engineWebView;
+    if (![webView isKindOfClass:[WKWebView class]]) return;
+
+    WKWebView *wk = (WKWebView *)webView;
+
+    // Restore original console methods
+    NSString *js =
+        @"(function(){"
+        "if(window.__origLog){console.log=window.__origLog;delete window.__origLog;}"
+        "if(window.__origErr){console.error=window.__origErr;delete window.__origErr;}"
+        "if(window.__origWarn){console.warn=window.__origWarn;delete window.__origWarn;}"
+        "delete window.__nativeConsoleActive;"
+        "})();";
+
+    [wk evaluateJavaScript:js completionHandler:nil];
+    [wk.configuration.userContentController removeScriptMessageHandlerForName:@"nativeConsole"];
+    self.consoleBridgeActive = NO;
+    NSLog(@"[NativeLogs] JS console capture bridge removed");
+}
+
+#pragma mark - WKScriptMessageHandler
+
+- (void)userContentController:(WKUserContentController *)userContentController didReceiveScriptMessage:(WKScriptMessage *)message
+{
+    if ([message.name isEqualToString:@"nativeConsole"]) {
+        NSDictionary *body = message.body;
+        NSString *level = body[@"level"] ?: @"log";
+        NSString *msg = body[@"msg"] ?: @"";
+        if (kJSConsoleOsLogEnabled) {
+            os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "[JSConsole][%{public}@] %{public}@", level, msg);
+        }
+    }
 }
 
 - (void)getLog:(CDVInvokedUrlCommand*)command {
